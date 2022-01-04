@@ -48,3 +48,4 @@ type gcControllerState struct {
 }
 ```
 
+gcController 会记录
