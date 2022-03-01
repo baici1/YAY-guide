@@ -14,7 +14,7 @@
       KEY `a` (`a`),
       KEY `b` (`b`)
     ) ENGINE=InnoDB;
-    
+
 
 然后，我们往表t中插入10万行记录，取值按整数递增，即：\(1,1,1\)，\(2,2,2\)，\(3,3,3\) 直到\(100000,100000,100000\)。
 
@@ -32,12 +32,12 @@
     end;;
     delimiter ;
     call idata();
-    
+
 
 接下来，我们分析一条SQL语句：
 
     mysql> select * from t where a between 10000 and 20000;
-    
+
 
 你一定会说，这个语句还用分析吗，很简单呀，a上有索引，肯定是要使用索引a的。
 
@@ -68,7 +68,7 @@
     set long_query_time=0;
     select * from t where a between 10000 and 20000; /*Q1*/
     select * from t force index(a) where a between 10000 and 20000;/*Q2*/
-    
+
 
 * 第一句，是将慢查询日志的阈值设置为0，表示这个线程接下来的语句都会被记录入慢查询日志中；
 * 第二句，Q1是session B原来的查询；
@@ -149,6 +149,17 @@ rows这个字段表示的是预计扫描行数。
 
 所以冤有头债有主，MySQL选错索引，这件事儿还得归咎到没能准确地判断出扫描行数。至于为什么会得到错误的扫描行数，这个原因就作为课后问题，留给你去分析了。
 
+> tips：
+>
+> 为什么会选择扫描10万行数据？
+>
+> * 扫描三万行数据会出现回表，扫描主键则不需要回表，优化器会认为前者代价高，选择后者。
+>
+> 为什么会出现错误扫描行数，Q2预期扫描时10000数据，但是却是37000但是Q1却没有问题？
+>
+> * session A开启事务并未提交，事务仍未提交，因此删除的数据只是**标记删除**，数据仍然在数据页中，后插入的数据需要找新的空位插入，这样查询时会**扫描删除的数据+后插入的数据+回表扫描主键索引，**因此扫描行数达到3万7千行
+> * 主键扫描行时按照表的函数进行估计的。
+
 既然是统计信息不对，那就修正。analyze table t 命令，可以用来重新统计索引信息。我们来看一下执行效果。
 
 ![](https://static001.geekbang.org/resource/image/20/9c/209e9d3514688a3bcabbb75e54e1e49c.png?wh=1736*397)
@@ -164,7 +175,7 @@ rows这个字段表示的是预计扫描行数。
 依然是基于这个表t，我们看看另外一个语句：
 
     mysql> select * from t where (a between 1 and 1000)  and (b between 50000 and 100000) order by b limit 1;
-    
+
 
 从条件上看，这个查询没有符合条件的记录，因此会返回空集合。
 
@@ -185,7 +196,7 @@ rows这个字段表示的是预计扫描行数。
 图8是执行explain的结果。
 
     mysql> explain select * from t where (a between 1 and 1000) and (b between 50000 and 100000) order by b limit 1;
-    
+
 
 ![](https://static001.geekbang.org/resource/image/48/b8/483bcb1ef3bb902844e80d9cbdd73ab8.png?wh=1891*163)
 
@@ -196,8 +207,13 @@ rows这个字段表示的是预计扫描行数。
 从这个结果中，你可以得到两个结论：
 
 1.  扫描行数的估计值依然不准确；
-
 2.  这个例子里MySQL又选错了索引。
+
+> tips：
+>
+> 为什么这里会选错索引？
+>
+> * 因为有 `order by b`，优化器认为走索引 b 可以避免排序； 虽然扫描行数高，但是认为代价小。
 
 # 索引选择异常和处理
 
@@ -238,7 +254,7 @@ rows这个字段表示的是预计扫描行数。
 如果你觉得修改语义这件事儿不太好，这里还有一种改法，图11是执行效果。
 
     mysql> select * from  (select * from t where (a between 1 and 1000)  and (b between 50000 and 100000) order by b limit 100)alias limit 1;
-    
+
 
 ![](https://static001.geekbang.org/resource/image/b1/d7/b1a2ad43c78477d7f93dbc692cbaa0d7.png?wh=1824*165)
 
@@ -273,6 +289,16 @@ rows这个字段表示的是预计扫描行数。
 这是什么原因呢？也请你分析一下吧。
 
 你可以把你的分析结论写在留言区里，我会在下一篇文章的末尾和你讨论这个问题。感谢你的收听，也欢迎你把这篇文章分享给更多的朋友一起阅读。
+
+> tips：
+>
+> 这一节主要讲解 mysql 优化器的bug。更多的体现对代价的判断与临时的处理。
+>
+> 考虑三个方面：
+>
+> * 统计信息行数不准确。
+> * 需要排序
+> * 临时表
 
 # 上期问题时间
 

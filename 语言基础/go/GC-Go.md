@@ -98,14 +98,12 @@ var work struct {
 4. **第二次 STW**
    * `gcphase` 置为 `_GCMarkTermination`
    * 停止后台 `mark worker` 和 `assist worker`
-   * `gcBlackenEnabled` 置为0
+   * `gcBlackenEnabled` 置为 0
    * `gphase` 置为 `_GCOff`
    * 关闭写屏障，`writeBarrier.enabled` 置为 `false`
 5. **Start The World，进入清扫阶段**
    * 进入 `_GCOff` 阶段以后，再新分配的对象就是白色的了。
    * `runtime.main` 在程序初始化时会创建用于清扫的协程 `bgsweep`，存储在全局变量 `sweep` 中，到清扫阶段这个后台的 `sweeper` 会被加入到 `run queue` 中，它得到调度执行时会执行清扫任务。因为清扫工作也是增量进行的，每一轮 GC 开始之前，都要确保完成上一轮 GC 未完成的清扫工作。
-
-
 
 ## 如何应对碎片化内存
 
@@ -139,7 +137,7 @@ var work struct {
 
 `span` 对应的数据结构是 `mspan`，每个 `span` 都只存储一种大小的元素，类型规格记录在 `mspan.spanClass`中，类型规格覆盖了小于等于 32K 的 66 种大小，类型编号 1~66。大于 32K 的大对象直接在`mheap` 中分配，对应 `mspan` 的类型编号为 0，这样一共有 67 种。
 
-同时 spanClass 还记录着该 `span` 存储元素是否含有指针，含有指针的属于 `scan` 类型，不含有指针的属于 `no-scan` 类型，所以总的来说 `span` 分类一共有 134 种。对于 `no-scan` 类型的 `mspan`，`GC` 并不关心。
+同时 `spanClass` 还记录着该 `span` 存储元素是否含有指针，含有指针的属于 `scan` 类型，不含有指针的属于 `no-scan` 类型，所以总的来说 `span` 分类一共有 134 种。对于 `no-scan` 类型的 `mspan`，`GC` 并不关心。
 
 `mheap.central` 提供全局 `span` 缓存，它按照 `spanClass` 类型区分共 134 个 `mcentral`。每个 `mcentral` 管理一种 `spanclass` 的 `mspan`，并且会将有空闲空间和没有空闲空间的 `mspan` 分别管理。
 
@@ -167,7 +165,7 @@ var work struct {
 
 介绍一下`HeapArena` 中`bitmap` 和 `spans` 字段。
 
-`bitmap` 中一个 `byte` 可以标记 `arena` 中连续四个指针大小的内存。对于每一个 `word` 来说，对应了两个 bit，
+`bitmap` 中一个 `byte` 可以标记 `arena` 中连续四个指针大小的内存。对于每一个 `word` 来说，对应了两个 `bit`，
 
 * 低位 `bit` 用于标记是否为指针，0 为非指针，1 为指针；
 * 高位 `bit` 用于标记是否要继续扫描，高位 `bit` 为 1 就代表扫描完当前 `word` 并不能完成当前数据对象的扫描。
@@ -196,4 +194,66 @@ var work struct {
 ## 并发标志的分工问题与写屏障记录集竞争问题
 
 每个 `P` 都有一个本地工作队列（`p.gcw`）和一个写屏障缓冲（`p.wbBuf`）。
+
+本地工作队列（`p.gcw`）里面有两个 `workbuf`：分别是 `wbuf1` 和 `wbuf2`。工作过程如下：
+
+* 添加任务从 `wbuf1` 添加
+* 当 `wbuf1` 满了时候，就会交换 `wbuf1` 和 `wbuf2` 。
+* 如果交换之后还是满的，那么就会把当前的 `wbuf1` 的工作 `flush` 到全局工作缓存中。
+
+`mark worker` 执行 `GC` 标记工作消耗工作队列时,会处理本地工作队列和全局工作缓存中工作量的均衡问题（`runtime.gcDrain`和`runtime.gcDrainN`中）
+
+* 如果全局工作缓存为空，就把当前的 `p` 的工作分一些到全局工作队列中。
+  * 如果 `wbuf2` 不为空，那么就将 `wbuf2` 整个 `flush` 到全局工作缓存中
+  * 如果 `wbuf2` 为空，那么考虑 `wbuf1`，如果 `wbuf1` 元素个数大于 4 ，就把 `wbuf1` 一半工作放到全局工作缓存中。
+* 如果本地工作队列为空，就会从全局工作缓存中获取任务放到本地队列中。
+
+当 `mutator` 触发写屏障时并不会直接操作工作队列，而是把相关指针写入当前 `p` 的写屏障缓冲区(`p.wbBuf`)中。当 `wbBuf` 已满或 `mark worker` 通过工作队列获取不到任务时,会把写屏障缓冲内容 `flush` 到工作缓存中,
+
+通过这样**区分本地工作队列与全局工作缓存，并为每个 P 设置了写屏障缓冲区**，缓解了执行并发标记工作时操作工作队列的竞争问题。
+
+## GC 对 CPU 的使用率
+
+`GC` 默认的 `CPU` 的使用率为 25%。在 `GC` 执行的初始化阶段，会根据当前 `CPU` 核数 X 以 `CPU` 目标使用率来计算需要启动的 `mark worker` 数量。 
+
+但是会出现：`6*25%=1.5` 计算结果不为整数的情况，为了应对此情况，会对该结果进行 `rounding`（+0.5）。
+
+但是这样的 `rounding` 会和目标使用率出现显著偏差（>0.3），所以在 `mark worker` 中引入了不同的工作模式:
+
+* **`Dedicated`** 模式的 `worker` 会执行标记任务直到被抢占；
+* **Fractional** 模式的 `worker` 除了被抢占外，还可以在达到目标使用率时主动让出。
+
+🌰：
+
+如果有4个核，经过计算 `4*25%=1`，需要启动一个 `Dedicated` 模式的 `worker`。
+
+如果有6个核，经过计算 `6*25%=1.5`，`rounding` 之后等于2，但是误差 `2/1.5-1=0.33`，大于0.3，所以启动一个 `Dedicated` 模式的 `worker` 和一个 `Fractional` 模式的 `worker` 来辅助完成额外的目标。
+
+·调度器执行 `findRunnableGcWorker` 恢复 `mark worker` 时，需要设置 `worker` 运行的模式：
+
+* 如果 `Dedicated` 模式的 `worker` 数目没有达到上限，就设置为 `Dedicated` 模式。
+* 接下来就要看是否需要 `Fractional` 模式的 `worker` 辅助工作，需要的话设置为 `Fractional` 模式
+
+P会记录自己执行 `Fractional` 模式的 `worker` 的时间，如果当前 `P` 执行 `Fractional` 模式的时间与本轮标记工作已经执行的时间的比率达到 `fractionalUtilizationGoal`，`Fractional` 模式的 `worker` 就可以主动让出了。
+
+通过以上方式有效控制 `GC` 的 `CPU` 使用率。
+
+## 并发GC如何缓解内存分配压力？
+
+为了避免 `GC` 执行过程中，内存分配压力过大，还实现了 `GC Assist` 机制，包括“辅助标记”和“辅助清扫”。
+
+辅助标价：
+
+如果协程在 `GC` 标记工作没有完成，想要分配内存，他就要负担一定的标记工作，申请的内存越大，对应负担的标记任务就越多，这是一种借贷偿还的机制。
+
+当 `mark worker` 完成一定量的标记任务就会在全局 `gcController` 存一笔信用，有债务需要偿还，可以从`gcController`这里 `steal` 尽量多的信用来抵消自己欠下的债务。
+
+![图片](https://mmbiz.qpic.cn/mmbiz_png/ibjI8pEWI9L4C74nN8hPUQ0bRKdzicldoeYQa1gicrhBS0tInnkXqNzeaTWc2bnSkS2gKQLIliaqw3eSJFZqyEwmEw/640?wx_fmt=png&wxfrom=5&wx_lazy=1&wx_co=1)
+
+在清扫阶段内存分配可能会触发“辅助清扫”。
+
+🌰：
+
+* 直接从 `mheap` 分配大对象时，为了维持内存分配量与清扫页面数的线性关系，可能需要执行一定量的清扫工作。
+* 从本地缓存中直接分配一个 `span` 时，若存在尚未清扫的可用 `span`，也需要先清扫这个 `span` 再分配使用
 
